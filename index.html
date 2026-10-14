@@ -1,0 +1,173 @@
+<!doctype html>
+<html lang="pt-BR">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<meta http-equiv="Content-Security-Policy" content="default-src 'none'; script-src 'sha256-P8xOCz8Di0ahw/PbznN3A7K4eT+SdDT6NHTk7Hze4QE='; style-src 'sha256-IHGz8oVAUn1vhwNXajpkOyVRjq19LM8UKELQSPE6gJY='; img-src 'none'; connect-src 'none'; form-action 'none'; base-uri 'none'">
+<meta name="referrer" content="no-referrer">
+<meta name="robots" content="noindex, nofollow">
+<title>Autorização Mercado Livre</title>
+<style>
+  :root { --bg:#f6f7f9; --card:#fff; --text:#1d2330; --muted:#5d6675; --accent:#2d6cdf; --warn:#9a5b00; --err:#b3261e; }
+  @media (prefers-color-scheme: dark) { :root { --bg:#14171c; --card:#1d2129; --text:#e8ebf0; --muted:#9aa3b2; --accent:#6d9cf0; --warn:#f0b35a; --err:#f2827a; } }
+  body { margin:0; background:var(--bg); color:var(--text); font:16px/1.5 system-ui, sans-serif; }
+  main { max-width:560px; margin:48px auto; padding:0 16px; }
+  .card { background:var(--card); border-radius:12px; padding:24px; box-shadow:0 1px 3px rgba(0,0,0,.12); }
+  h1 { font-size:20px; margin:0 0 12px; }
+  h2 { font-size:15px; margin:20px 0 4px; }
+  p { color:var(--muted); margin:8px 0; }
+  label { display:block; font-size:14px; margin:12px 0 4px; }
+  input { width:100%; box-sizing:border-box; padding:10px; border-radius:8px; border:1px solid var(--muted); background:var(--bg); color:var(--text); font-size:15px; }
+  code { display:block; word-break:break-all; padding:12px; border-radius:8px; background:var(--bg); font-size:14px; margin:8px 0; }
+  button { background:var(--accent); color:#fff; border:0; border-radius:8px; padding:10px 16px; font-size:15px; cursor:pointer; margin-top:12px; }
+  .warn { color:var(--warn); font-size:14px; }
+  .err { color:var(--err); }
+  [hidden] { display:none !important; }
+</style>
+</head>
+<body>
+<main>
+  <div class="card">
+    <h1>Autorização Mercado Livre</h1>
+
+    <!-- Modo 1: iniciar autorização -->
+    <section id="start" hidden>
+      <p>Esta página inicia a autorização OAuth (com state e PKCE) e exibe o código de retorno. Nada é enviado a nenhum servidor além do próprio Mercado Livre.</p>
+      <label for="clientId">Client ID da aplicação (número público; nunca digite o Client Secret aqui)</label>
+      <input id="clientId" inputmode="numeric" autocomplete="off" spellcheck="false">
+      <p id="startErr" class="err" hidden></p>
+      <button id="go" type="button">Autorizar no Mercado Livre</button>
+    </section>
+
+    <!-- Modo 2: retorno com sucesso -->
+    <section id="ok" hidden>
+      <p>Autorização validada (state conferido). Use os dois valores abaixo <strong>imediatamente</strong> no passo de inicialização do Actor: o código expira em poucos minutos e só pode ser usado uma vez.</p>
+      <h2>Código de autorização (code)</h2>
+      <code id="code"></code>
+      <button id="copyCode" type="button">Copiar code</button>
+      <h2>Code verifier (PKCE)</h2>
+      <code id="verifier"></code>
+      <button id="copyVerifier" type="button">Copiar code verifier</button>
+      <p class="warn">Não envie estes valores pelo chat nem para terceiros. Ao fechar esta aba eles desaparecem.</p>
+    </section>
+
+    <!-- Modo 3: erro -->
+    <section id="fail" hidden>
+      <p class="err" id="failMsg"></p>
+      <p>Nenhum código foi exibido. Volte ao início desta página e clique em "Autorizar" novamente.</p>
+    </section>
+  </div>
+</main>
+<script>
+(function () {
+  'use strict';
+  var STORE_KEY = 'ml_oauth_pending';
+  var MAX_AGE_MS = 10 * 60 * 1000; // tentativa de autorização válida por 10 minutos
+  var AUTH_URL = 'https://auth.mercadolivre.com.br/authorization';
+  var redirectUri = window.location.origin + window.location.pathname;
+
+  function $(id) { return document.getElementById(id); }
+  function show(id) { $(id).hidden = false; }
+
+  function b64url(bytes) {
+    var s = '';
+    for (var i = 0; i < bytes.length; i++) s += String.fromCharCode(bytes[i]);
+    return btoa(s).replace(/\+/g, '-').replace(/\//g, '_').replace(/=+$/, '');
+  }
+  function randomToken(n) {
+    var a = new Uint8Array(n);
+    crypto.getRandomValues(a);
+    return b64url(a);
+  }
+  function safeGet() {
+    try { return JSON.parse(sessionStorage.getItem(STORE_KEY)); } catch (e) { return null; }
+  }
+  function safeClear() {
+    try { sessionStorage.removeItem(STORE_KEY); } catch (e) {}
+  }
+  function constEq(a, b) {
+    if (typeof a !== 'string' || typeof b !== 'string' || a.length !== b.length) return false;
+    var r = 0;
+    for (var i = 0; i < a.length; i++) r |= a.charCodeAt(i) ^ b.charCodeAt(i);
+    return r === 0;
+  }
+  function fail(msg) {
+    $('failMsg').textContent = msg;
+    show('fail');
+  }
+  function copyBtn(btnId, value) {
+    $(btnId).addEventListener('click', function () {
+      navigator.clipboard.writeText(value).then(function () { $(btnId).textContent = 'Copiado'; });
+    });
+  }
+
+  var params = new URLSearchParams(window.location.search);
+  var hasReturn = params.has('code') || params.has('error') || params.has('state');
+
+  if (hasReturn) {
+    // Lê os parâmetros e limpa a URL ANTES de qualquer outra coisa.
+    var code = params.get('code');
+    var state = params.get('state');
+    var error = params.get('error');
+    history.replaceState(null, '', window.location.pathname);
+
+    var pending = safeGet();
+    safeClear(); // a tentativa só pode ser usada uma vez
+
+    if (error) { fail('O Mercado Livre retornou um erro: ' + error); return; }
+    if (!pending || !pending.state || !pending.verifier) {
+      fail('Nenhuma autorização iniciada nesta aba foi encontrada. Por segurança, o retorno foi descartado.');
+      return;
+    }
+    if (Date.now() - pending.created > MAX_AGE_MS) {
+      fail('A tentativa de autorização expirou (mais de 10 minutos). Por segurança, o retorno foi descartado.');
+      return;
+    }
+    if (!constEq(state, pending.state)) {
+      fail('O parâmetro state não confere. Possível tentativa de falsificação; o retorno foi descartado.');
+      return;
+    }
+    if (!code) { fail('O retorno não trouxe código de autorização.'); return; }
+
+    $('code').textContent = code;
+    $('verifier').textContent = pending.verifier;
+    copyBtn('copyCode', code);
+    copyBtn('copyVerifier', pending.verifier);
+    show('ok');
+    return;
+  }
+
+  // Modo início
+  show('start');
+  $('go').addEventListener('click', function () {
+    var clientId = $('clientId').value.trim();
+    if (!/^\d{5,25}$/.test(clientId)) {
+      $('startErr').textContent = 'Informe o Client ID (somente números).';
+      $('startErr').hidden = false;
+      return;
+    }
+    var state = randomToken(32);
+    var verifier = randomToken(64); // 86 caracteres, dentro do limite PKCE (43-128)
+    crypto.subtle.digest('SHA-256', new TextEncoder().encode(verifier)).then(function (hash) {
+      var challenge = b64url(new Uint8Array(hash));
+      try {
+        sessionStorage.setItem(STORE_KEY, JSON.stringify({ state: state, verifier: verifier, created: Date.now() }));
+      } catch (e) {
+        $('startErr').textContent = 'O navegador bloqueou o armazenamento da sessão. Desative o modo restrito e tente de novo.';
+        $('startErr').hidden = false;
+        return;
+      }
+      var url = AUTH_URL +
+        '?response_type=code' +
+        '&client_id=' + encodeURIComponent(clientId) +
+        '&redirect_uri=' + encodeURIComponent(redirectUri) +
+        '&state=' + encodeURIComponent(state) +
+        '&code_challenge=' + encodeURIComponent(challenge) +
+        '&code_challenge_method=S256';
+      window.location.assign(url);
+    });
+  });
+})();
+</script>
+</body>
+</html>
